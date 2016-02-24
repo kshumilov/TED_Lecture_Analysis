@@ -27,15 +27,18 @@ import pandas as pd
 logging.basicConfig(level=logging.INFO,
                     format='%(filename)s[LINE:%(lineno)d]# %(levelname)-5s [%(asctime)s]  %(message)s')
 
+# Созданеи объектов выделения словоформ и корней
 stemmer = PorterStemmer()
 lemmer = WordNetLemmatizer()
 
+# Бесполезные слова
 STOP_WORDS = [stemmer.stem(w) for w in stopwords.words('english') + [
     're go', '—', 'yeah', 'okay', 'ok', 'oh', 'ye', 'bit', 'whole', 'ever', 'bit', 're', 'go', 'c', 'isn', 'per',
     're look', 're talk', 're try', 'really want', 'say go', 'say know', 'say re', 'say well', 'th']]
+
 BAD_WORDS = word_tokenize(' '.join(list(punctuation) + stopwords.words('english') + ['s', 't', 'll', 've',
-                                                                                     'd', 'm', 'c', 're']))
-possible_tags = {'VERB': 'v', 'NOUN': 'n', 'ADJ': 'a', 'ADV': 'r'}
+                                                                                    'd', 'm', 'c', 're']))
+POSSIBLE_TAGS = {'VERB': 'v', 'NOUN': 'n', 'ADJ': 'a', 'ADV': 'r'}
 
 
 def prepare_texts(return_indexes=False) -> tuple:
@@ -47,17 +50,21 @@ def prepare_texts(return_indexes=False) -> tuple:
     :param return_indexes: Если True, то функция список индексов лекций вместо их названий
     :return: кортеж списков
     """
+
+    # Загрузка коллекции лекций
     t0 = time()
     data = download_collection('lectures')
     texts = []
     id2text = []
     omitted_ids = []
     if return_indexes:
+        # Создание списка документов
         for i in data['text'].index:
             if data.loc[i, 'text'] != '':
                 texts.append(data.loc[i, 'text'])
                 id2text.append(int(i))
             else:
+                # Сбор документов, неимеющих тексты
                 omitted_ids.append(int(i))
     else:
         for i in data['text'].index:
@@ -76,7 +83,7 @@ def prepare_texts(return_indexes=False) -> tuple:
     return texts, id2text
 
 
-def process_text(raw_text: str, stemmatize=True, lemmatize=True) -> list:
+def _process_text(raw_text: str, stemming=True, lemmatize=True) -> list:
     """
     Функция обрабатывает текст, разбивая его на отдельные слова. Затем из этих слов выделюятся отедльные словоформы,
     из которых потом выделются корни. При этом из текстов удаляется вся пунктуация и бесполезные слова.
@@ -97,14 +104,14 @@ def process_text(raw_text: str, stemmatize=True, lemmatize=True) -> list:
         result = []
         for token in tokens:
             if token[0] not in BAD_WORDS:
-                if token[1] in possible_tags:
-                    token_prep = lemmer.lemmatize(token[0], pos=possible_tags[token[1]])
+                if token[1] in POSSIBLE_TAGS:
+                    token_prep = lemmer.lemmatize(token[0], pos=POSSIBLE_TAGS[token[1]])
                     result.append(token_prep)
                 else:
                     result.append(token[0])
         tokens = result
 
-    if stemmatize:
+    if stemming:
         tokens = [stemmer.stem(token) for token in tokens]
 
     return tokens
@@ -145,7 +152,7 @@ def get_corpus(texts: list, vectorizer, min_df=0.1, max_df=0.5):
 
         # Создание объекта векторизатора
         t0 = time()
-        vector = vectorizer(tokenizer=process_text, analyzer='word', stop_words=STOP_WORDS, max_df=max_df,
+        vector = vectorizer(tokenizer=_process_text, analyzer='word', stop_words=STOP_WORDS, max_df=max_df,
                             min_df=min_df, lowercase=True)
         logging.info('{0} vectorizer created in {1:.3}sec'.format(corpus_type, time() - t0))
 
@@ -165,16 +172,17 @@ def get_corpus(texts: list, vectorizer, min_df=0.1, max_df=0.5):
     return corpus, feature_names
 
 
-def kcluster_text(id2text: list, n_clusters: int, n_components: int, id2word, corpus, n_top_features=10):
+def kcluster_text(corpus, n_clusters: int, id2text: list, id2word: list, n_components: int, n_top_features=10,
+                  dump_to_db=False) -> tuple:
     """
     Ф-ция проводит кластеризацию текстов методом k-средних и загружает полученные кластеры в базу данных
 
-    :param id2text: Список текстов
+    :param id2text: Список имен (индексов) текстов
     :param n_clusters: Число кластеров
     :param n_components: Число самых важных слов, по которым проводится кластеризация
     :param id2word: Список слов
-    :param corpus: Корпус документов
-    :param n_top_features: Число слов, характеризующих кластер
+    :param corpus: Корпус текстов
+    :param n_top_features: Число выводимых слов, характеризующих кластер
     :return: Словарь кластеров, а так же
     """
 
@@ -213,8 +221,9 @@ def kcluster_text(id2text: list, n_clusters: int, n_components: int, id2word, co
             top_features[cluster_id].append(id2word[word_id])
 
     # Если в качестве id2text данны индексы, то происходит запись кластеров в базу данных
-    if isinstance(id2text[0], int):
+    if dump_to_db:
         collection = connect_to_db()['k_clusters']
+        collection.drop()
         logging.info("Table '{0}_{1}' created ".format('clusters', n_clusters))
         for cluster_id in dict(clusters):
             doc = {'_id': int(cluster_id), 'top_words': top_features[cluster_id],
@@ -222,39 +231,70 @@ def kcluster_text(id2text: list, n_clusters: int, n_components: int, id2word, co
             logging.info("Cluster {} dumped to database".format(int(cluster_id)))
             collection.insert(doc)
 
+    # Сведение данных в один список
     result = [{'_id': int(cluster_id), 'top_words': top_features[cluster_id], 'titles': clusters[int(cluster_id)]}
               for cluster_id in clusters]
 
     return result, cluster_labels
 
 
-def silhouette_analysis(corpus, cluster_labels):
-    n_cluster = len(cluster_labels)
+def silhouette_analysis(corpus, cluster_labels) -> None:
+    """
+    Построение силуэтного графика для оценки качества проведенной кластеризации
+
+    :param corpus: Начальный корпус текстов
+    :param cluster_labels: Список текстов, приписанных к кластерам
+    :return: None
+    """
+
+    # Определение числа кластеров
+    n_cluster = len(np.unique(cluster_labels))
+
+    #  Установка стиля
     plt.style.use('ggplot')
+
+    # Создание окна для построение графика
     fig = plt.figure(n_cluster, figsize=(8, 6))
     ax1 = plt.subplot(111)
     ax1.axis([0, len(cluster_labels) + (n_cluster + 1) * 25, -0.15, 1])
-    logging.DEBUG('Figure created')
+    logging.debug('Figure created')
 
+    # Подсчет среднего значения силуэтного коэффициента
     silhouette_avg = silhouette_score(corpus, cluster_labels)
     print('For n_clusters = {0} the average silhouette_score is :{1}'.format(n_cluster, silhouette_avg))
+
+    # Подсчет силуэтного коэффициента для каждого документа
     sample_silhouette_values = silhouette_samples(corpus, cluster_labels)
+
+    # Начальный отступ и левая граница первого кластера
     x_left = 25
+
+    # Итерация по кластерам для пострения каждого
     for i in range(n_cluster):
+        # Выбор и сортировка по убыванию значений силуэтных коэффициентов для тексто пренадлежащих i-ому кластеру
         ith_cluster_silhouette_values = sample_silhouette_values[cluster_labels == i]
         ith_cluster_silhouette_values.sort()
-
         ith_cluster_silhouette_values = ith_cluster_silhouette_values[::-1]
+
+        # Подсчет числа текстов в кластере
         size_cluster_i = ith_cluster_silhouette_values.shape[0]
+
+        # Расчет правой границы i-ого кластера
         x_right = x_left + size_cluster_i
+
+        # Заполенение графика кластера одним цветом
         color = cm.spectral(float(i) / n_cluster)
         ax1.fill_between(np.arange(x_left, x_right), 0, ith_cluster_silhouette_values, facecolor=color,
                          edgecolor=color, alpha=0.7, label='{}'.format(i))
+
+        # Расчет левой границы следующиего кластера
         x_left = x_right + 25
 
     plt.title('The silhouette plot for {} clusters'.format(n_cluster))
     ax1.set_xlabel("Texts ids")
     ax1.set_ylabel("The silhouette coefficient values")
+
+    # Отметка среднего силуэтного коэффициента для всех текстов
     ax1.axhline(y=silhouette_avg, color="red", linestyle="--")
     ax1.set_yticks([-0.1, 0, 0.2, 0.4, 0.6, 0.8, 1])
     ax1.set_xticks([])
@@ -267,15 +307,15 @@ def silhouette_analysis(corpus, cluster_labels):
     plt.show()
 
 
-def assign_topics_lda(n_topics: int, names, model, features, top_features=10, dump_to_db=True):
+def assign_topics_lda(n_topics: int, id2text, corpus, id2word, n_top_features=10, dump_to_db=True):
     """
     Возвращает вероятностное распределение документов по темам
-    :param n_topics:
-    :param names:
-    :param model:
-    :param features: слова в текстах
-    :param top_features:
-    :param dump_to_db:
+    :param n_topics: Число возможных тем (топиков)
+    :param id2text: Список имен (индексов) текстов
+    :param corpus: текстов
+    :param id2word: Список слов
+    :param n_top_features: Число выводимых слов, характеризующих кластер
+    :param dump_to_db: True - записывает топики в базу данных, False - не записывает топики в базуданных
     :return:
     """
     t0 = time()
@@ -283,7 +323,7 @@ def assign_topics_lda(n_topics: int, names, model, features, top_features=10, du
     logging.info('LDA created in {:.3} sec'.format(time() - t0))
 
     t0 = time()
-    doc_topic_dist = lda.fit_transform(model)
+    doc_topic_dist = lda.fit_transform(corpus)
     logging.info('LDA model fit-transformed in {:.3} sec'.format(time() - t0))
 
     if dump_to_db:
@@ -291,24 +331,24 @@ def assign_topics_lda(n_topics: int, names, model, features, top_features=10, du
         lda_topics.drop()
         for topic_idx, topic_dist in enumerate(lda.topic_word_):
             doc = {'_id': int(topic_idx),
-                   'terms': [features[i] for i in np.argsort(topic_dist)[:-top_features - 1:-1]]}
+                   'terms': [id2word[i] for i in np.argsort(topic_dist)[:-n_top_features - 1:-1]]}
             lda_topics.insert(doc)
             logging.info('Topic {} dumped to database'.format(topic_idx))
 
     topics = {}
     for topic_idx, topic_dist in enumerate(lda.topic_word_):
-        topics[topic_idx] = [features[i] for i in np.argsort(topic_dist)[:-top_features - 1:-1]]
+        topics[topic_idx] = [id2word[i] for i in np.argsort(topic_dist)[:-n_top_features - 1:-1]]
     docs_topics = []
     for text in doc_topic_dist:
         doc = {}
         for topic_id, topic_value in enumerate(text):
             doc[str(int(topic_id))] = topic_value
         docs_topics.append(doc)
-    docs_topics = pd.DataFrame(docs_topics, index=names)
+    docs_topics = pd.DataFrame(docs_topics, index=id2text)
     return topics, docs_topics, lda
 
 
-def plot_topics(model, plots_per_figure=5):
+def plot_lda_topics(model, plots_per_figure=5):
     n_topics = len(model.components_)
     plt.style.use('ggplot')
     for j in range(0, n_topics, plots_per_figure):
@@ -499,27 +539,9 @@ def lda(n_topics, doc_percent, return_indexes=True):
     topics_alfa = transform_docs_to_alfa(docs_topics)
     pprint(topics, compact=True)
     pprint(clusters, compact=True)
-    plot_topics(lda_model, plots_per_figure=5)
+    plot_lda_topics(lda_model, plots_per_figure=5)
     plot_alfa(topics_alfa)
     plot_alfa_dx(topics_alfa)
-
-
-def speaker_popularity(collection):
-    result = []
-    cluster = download_collection(collection)
-    for i in cluster.index:
-        result.append((len(cluster.loc[i, 'lectures']), i))
-    result.sort(reverse=True)
-    print(result)
-
-
-def score_rating(collection, top=5):
-    score_cluster = download_collection(collection, nested_dict='scores')
-    for col in score_cluster.columns:
-        a = score_cluster[col].copy()
-        a.sort_values(ascending=False)
-        print(col)
-        print(a[:top])
 
 
 if __name__ == "__main__":
