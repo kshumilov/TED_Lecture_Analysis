@@ -6,12 +6,11 @@ from string import punctuation
 from time import time
 from data_collection import download_collection, connect_to_db
 from bson.dbref import DBRef
-from lda import LDA
 from nltk import word_tokenize, pos_tag
 from nltk.corpus import stopwords
 from nltk.stem import PorterStemmer, WordNetLemmatizer
 from sklearn.cluster import KMeans
-from sklearn.decomposition import TruncatedSVD
+from sklearn.decomposition import TruncatedSVD, LatentDirichletAllocation
 from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
 from sklearn.metrics import silhouette_score, silhouette_samples
 from sklearn.pipeline import make_pipeline
@@ -36,8 +35,8 @@ STOP_WORDS = [stemmer.stem(w) for w in stopwords.words('english') + [
     're go', '—', 'yeah', 'okay', 'ok', 'oh', 'ye', 'bit', 'whole', 'ever', 'bit', 're', 'go', 'c', 'isn', 'per',
     're look', 're talk', 're try', 'really want', 'say go', 'say know', 'say re', 'say well', 'th']]
 
-BAD_WORDS = word_tokenize(' '.join(list(punctuation) + stopwords.words('english') + ['s', 't', 'll', 've',
-                                                                                    'd', 'm', 'c', 're']))
+BAD_WORDS = word_tokenize(' '.join(list(punctuation) + stopwords.words('english') + ['s', 't', 'll', 've', 'd', 'm',
+                                                                                     'c', 're']))
 POSSIBLE_TAGS = {'VERB': 'v', 'NOUN': 'n', 'ADJ': 'a', 'ADV': 'r'}
 
 
@@ -79,11 +78,13 @@ def prepare_texts(return_indexes=False) -> tuple:
         for id in omitted_ids:
             file.write(str(id) + '\n')
         file.close()
+    with open('tmp/samples.pickle', 'wb') as file:
+        pickle.dump(id2text, file)
 
     return texts, id2text
 
 
-def _process_text(raw_text: str, stemming=True, lemmatize=True) -> list:
+def _preprocess_text(raw_text: str, stemming=True, lemmatize=True) -> list:
     """
     Функция обрабатывает текст, разбивая его на отдельные слова. Затем из этих слов выделюятся отедльные словоформы,
     из которых потом выделются корни. При этом из текстов удаляется вся пунктуация и бесполезные слова.
@@ -122,12 +123,13 @@ def get_corpus(texts: list, vectorizer, min_df=0.1, max_df=0.5):
     Создает корпус текстов в формате [n_samples, n_features].
     Если такой корпус уже существует, то он загружается.
 
+    :param vectorizer: Тип векторизатора: CountVectorizer или TfidfVectorizer
     :param texts: Список кластеризуемых текстов
     :param min_df: Минимальная частота, с которой слово должно встречаться в текстах; слова, частота которых ниже
     данной частоты отбарсываются
     :param max_df: Максимальная частота, с которой слово должно встречаться в текстах; слова, частота которых выше
     данной частоты отбарсываются Tf или Tf-idf
-    :return: Корпус документов и списко слов
+    :return: Корпус документов и списков слов
     """
     # Проверка типа векторизатора
     if issubclass(vectorizer, TfidfVectorizer):
@@ -152,7 +154,7 @@ def get_corpus(texts: list, vectorizer, min_df=0.1, max_df=0.5):
 
         # Создание объекта векторизатора
         t0 = time()
-        vector = vectorizer(tokenizer=_process_text, analyzer='word', stop_words=STOP_WORDS, max_df=max_df,
+        vector = vectorizer(tokenizer=_preprocess_text, analyzer='word', stop_words=STOP_WORDS, max_df=max_df,
                             min_df=min_df, lowercase=True)
         logging.info('{0} vectorizer created in {1:.3}sec'.format(corpus_type, time() - t0))
 
@@ -307,49 +309,62 @@ def silhouette_analysis(corpus, cluster_labels) -> None:
     plt.show()
 
 
-def assign_topics_lda(n_topics: int, id2text, corpus, id2word, n_top_features=10, dump_to_db=True):
+def _normalize_weights(dist):
+    total_weight = dist.sum()
+    dist = [x / total_weight for x in dist]
+    return np.array(dist)
+
+
+def lda_topics_modeling(n_topics: int, id2text, corpus, id2word, n_top_features=10, dump_to_db=True):
     """
     Возвращает вероятностное распределение документов по темам
+
     :param n_topics: Число возможных тем (топиков)
     :param id2text: Список имен (индексов) текстов
     :param corpus: текстов
     :param id2word: Список слов
     :param n_top_features: Число выводимых слов, характеризующих кластер
     :param dump_to_db: True - записывает топики в базу данных, False - не записывает топики в базуданных
-    :return:
+    :return: кортеж с распределений слов по темам и документов по темам
     """
+
     t0 = time()
-    lda = LDA(n_topics=n_topics, n_iter=500, random_state=1)
+    lda = LatentDirichletAllocation(n_topics=n_topics)
     logging.info('LDA created in {:.3} sec'.format(time() - t0))
 
     t0 = time()
     doc_topic_dist = lda.fit_transform(corpus)
     logging.info('LDA model fit-transformed in {:.3} sec'.format(time() - t0))
 
+    # Загрузка полученных топиков в базу данных
     if dump_to_db:
         lda_topics = connect_to_db()['lda_clusters']
         lda_topics.drop()
-        for topic_idx, topic_dist in enumerate(lda.topic_word_):
+        for topic_idx, topic_dist in enumerate(lda.components_):
             doc = {'_id': int(topic_idx),
                    'terms': [id2word[i] for i in np.argsort(topic_dist)[:-n_top_features - 1:-1]]}
             lda_topics.insert(doc)
             logging.info('Topic {} dumped to database'.format(topic_idx))
 
-    topics = {}
-    for topic_idx, topic_dist in enumerate(lda.topic_word_):
-        topics[topic_idx] = [id2word[i] for i in np.argsort(topic_dist)[:-n_top_features - 1:-1]]
-    docs_topics = []
-    for text in doc_topic_dist:
-        doc = {}
-        for topic_id, topic_value in enumerate(text):
-            doc[str(int(topic_id))] = topic_value
-        docs_topics.append(doc)
-    docs_topics = pd.DataFrame(docs_topics, index=id2text)
-    return topics, docs_topics, lda
+    # Нормализация весов (получение вероятностей)
+    topic_word_dist = np.apply_along_axis(_normalize_weights, 1, lda.components_)
+    doc_topic_dist = np.apply_along_axis(_normalize_weights, 1, doc_topic_dist)
+
+    topic_word_dist = pd.DataFrame(topic_word_dist, index=id2word)
+    doc_topic_dist = pd.DataFrame(doc_topic_dist, columns=id2text)
+
+    return topic_word_dist, doc_topic_dist, lda
 
 
-def plot_lda_topics(model, plots_per_figure=5):
-    n_topics = len(model.components_)
+def plot_lda_topics(topic_word_dist: pd.DataFrame, plots_per_figure=5):
+    """
+    Рисует графики для оценки качетсва полученных топиков
+
+    :param topic_word_dist:
+    :param plots_per_figure:
+    :return:
+    """
+    n_topics = len(topic_word_dist)
     plt.style.use('ggplot')
     for j in range(0, n_topics, plots_per_figure):
         if j == (n_topics // plots_per_figure) * plots_per_figure:
@@ -358,53 +373,55 @@ def plot_lda_topics(model, plots_per_figure=5):
             m = j + plots_per_figure
         f, ax = plt.subplots(m - j, 1, figsize=(8, 6), sharex=True, squeeze=False)
         for i, k in enumerate(range(j, m)):
-            ax[i, 0].stem(model.topic_word_[k, :], linefmt='b-', markerfmt='bo', basefmt='w-')
+            ax[i, 0].stem(topic_word_dist.loc[k, :], linefmt='b-', markerfmt='bo', basefmt='w-')
             ax[i, 0].set_xlim(-10, 850)
             ax[i, 0].set_ylim(0, 0.1)
             ax[i, 0].set_ylabel("Prob")
             ax[i, 0].set_title("Topic {}".format(k))
-            ave_prob = sum(model.topic_word_[k, :]) / len(model.topic_word_[k, :])
+            ave_prob = sum(topic_word_dist.loc[k, :]) / len(topic_word_dist.loc[k, :])
             ax[i, 0].axhline(y=ave_prob, color="red", linestyle="--")
         ax[m - j - 1, 0].set_xlabel("word")
         plt.tight_layout()
     plt.show()
 
 
-def estimate_alfa(docs_procent, docs_topics, plot=True):
+def estimate_threshold(docs_procent: int, docs_topics: pd.DataFrame, plot=True):
     """
     Функция для выбора порога
     :param docs_procent: Процент документов, которые должны войти в
     :param docs_topics: Вероятностное распределение документов по темам
-    :param plot:
-    :return:
+    :param plot: True - строит график, False - не строит график
+    :return: Порог, при котором хотя бы docs_procent процентов документов приязаны к топикам
     """
+    n_samples = len(docs_topics)
     logging.info('Docs_topics downloaded')
-    docs_alfa = pd.DataFrame()
-    for alfa in np.arange(0.0, 1, 0.005):
+    docs_alpha = pd.DataFrame()
+    for alpha in np.arange(0.0, 1, 0.005):
         for i in docs_topics.index:
-            if docs_topics.loc[i].max() >= alfa:
-                docs_alfa.set_value(i, str(alfa), True)
+            if docs_topics.loc[i].max() >= alpha:
+                docs_alpha.set_value(i, str(alpha), True)
             else:
-                docs_alfa.set_value(i, str(alfa), False)
-        logging.info('Alfa {} counted'.format(alfa))
+                docs_alpha.set_value(i, str(alpha), False)
+        logging.info('Alfa {} counted'.format(alpha))
 
-    procent = np.array([docs_alfa[col].sum() for col in docs_alfa.columns]) / 2040 * 100
+    procent = np.array([docs_alpha[col].sum() for col in docs_alpha]) / n_samples * 100
     logging.info('Procent array created')
 
     if plot:
         plt.style.use('ggplot')
-        plt.plot(procent[::-1], docs_alfa.columns.values.astype(float)[::-1])
+        plt.plot(procent[::-1], docs_alpha.columns.values.astype(float)[::-1])
         plt.axvline(x=docs_procent, color="red", linestyle="--")
-        plt.ylabel("Alfa")
+        plt.ylabel("Alpha")
         plt.xlabel("% Docs assigned to some topic")
         plt.xlim(0, 100)
         plt.ylim(0, 1)
         plt.show()
 
-    f = interpolate.interp1d(procent[::-1], docs_alfa.columns.values.astype(float)[::-1])
+    f = interpolate.interp1d(procent[::-1], docs_alpha.columns.values.astype(float)[::-1])
     return round(f(docs_procent).tolist(), 2)
 
 
+########################################################################################################################
 def transform_docs_to_alfa(docs_topics, max_alfa=1, step_alfa=0.005):
     table_T = docs_topics.T
     topics_alfa = pd.DataFrame()
@@ -463,10 +480,11 @@ def plot_alfa_dx(topics_alfa):
     plt.show()
 
 
-def lda_cluster_text(alfa, docs_topics, dumb_to_db=True):
+########################################################################################################################
+def lda_cluster_text(alpha: float, docs_topics: pd.DataFrame, dumb_to_db=True):
     """
     Формирует кластеры и записывает их в базу данных
-    :param alfa: порог
+    :param alpha: Порог
     :param docs_topics: Вероятностное распределение документов по темам
     :param dumb_to_db:
     :return:
@@ -476,12 +494,13 @@ def lda_cluster_text(alfa, docs_topics, dumb_to_db=True):
     logging.info('Docs_topics transposed')
     for i in topics_docs.index:
         for col in topics_docs.columns:
-            if topics_docs.loc[i, col] >= alfa:
+            if topics_docs.loc[i, col] >= alpha:
                 clusters[int(i)].append(int(col))
     logging.info('Clusters created')
 
     if dumb_to_db:
         lda_topics = connect_to_db()['lda_clusters']
+        lda_topics.drop()
         logging.info('lda_topics connected')
         for topic_idx in clusters:
             lectures = [DBRef('lectures', id) for id in clusters[topic_idx]]
@@ -532,8 +551,8 @@ def k_means(n_cluster, n_components):
 def lda(n_topics, doc_percent, return_indexes=True):
     texts, names = prepare_texts(return_indexes=return_indexes)
     model, features = get_corpus(texts, CountVectorizer)
-    topics, docs_topics, lda_model = assign_topics_lda(n_topics, names, model, features)
-    alfa = estimate_alfa(doc_percent, docs_topics)
+    topics, docs_topics, lda_model = lda_topics_modeling(n_topics, names, model, features)
+    alfa = estimate_threshold(doc_percent, docs_topics)
     clusters = lda_cluster_text(alfa, docs_topics)
     score_clusters('lda_clusters')
     topics_alfa = transform_docs_to_alfa(docs_topics)

@@ -171,12 +171,12 @@ def download_ted_lectures(i=1, collection='lectures') -> None:
     file.close()
 
 
-def download_ted_lecture(i) -> None:
+def download_ted_lecture(i, collection='lectures') -> None:
     """
     Действует аналогично upload_ted_lectures() только загружает одну лекцию
     :return: Индекс лекции
     """
-    lectures = connect_to_db()['lectures']
+    lectures = connect_to_db()[collection]
     try:
         page = get_page(i)
         logging.info("Page {0} downloaded".format(i))
@@ -190,4 +190,5 @@ def download_ted_lecture(i) -> None:
 
 
 if __name__ == "__main__":
-    download_ted_lectures(i=1, collection='lectures')
+    i = int(input())
+    download_ted_lecture(i=i)
